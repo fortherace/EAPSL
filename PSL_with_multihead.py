@@ -54,8 +54,6 @@ sampling_method = 'Bernoulli'
 # device
 device = 'cpu'
 # -----------------------------------------------------------------------------
-hv_list = {}
-
 for test_ins in ins_list:
     print(test_ins)
     problem = get_problem(test_ins)
@@ -81,7 +79,10 @@ for test_ins in ins_list:
 
     if n_obj == 2:
         n_pref_update = 5
-        n_steps = 134
+        if test_ins == 'polygons':
+            n_steps = 300
+        else:
+            n_steps = 133
     else:
         n_pref_update = 8
         n_steps = 375
@@ -96,12 +97,10 @@ for test_ins in ins_list:
         psmodel = ParetoSetModel(n_dim, n_obj)
         psmodel.to(device)
 
-        # optimizer
         optimizer = schedulefree.AdamWScheduleFree(psmodel.parameters(), lr=0.0025, warmup_steps=10)
 
         z = torch.ones(n_obj).to(device)
 
-        # EPSL steps
         for t_step in range(n_steps):
             psmodel.train()
             optimizer.train()
@@ -119,7 +118,7 @@ for test_ins in ins_list:
 
             for k in range(n_pref_update):
                 for head_idx in range(n_heads):
-                    xk = outputs[head_idx][k]  
+                    xk = outputs[head_idx][k] 
 
                     if sampling_method == 'Gaussian':
                         delta = torch.randn(n_sample, n_dim).to(device).double()
@@ -136,7 +135,7 @@ for test_ins in ins_list:
                     x_plus_delta = xk.detach() + sigma * delta
                     x_plus_delta = torch.clamp(x_plus_delta, 0.0, 1.0)
                     x_np = x_plus_delta.cpu().numpy() * (ub - lb) + lb
-                    value = problem.evaluate(x_np)  # shape: (n_sample, n_obj)
+                    value = problem.evaluate(x_np)
                     value = (value - ideal_point) / (nadir_point - ideal_point)
                     value = torch.tensor(value, dtype=torch.float32).to(device)
 
@@ -153,14 +152,18 @@ for test_ins in ins_list:
                     grad_es_k = 1.0 / (n_sample * sigma) * torch.sum(rank[:, None] * delta, dim=0)
                     grad_es_lists[head_idx].append(grad_es_k)
 
-            grad_es_heads = [torch.stack(grads).to(device).float() for grads in grad_es_lists]
+            dummy_loss = 0.0
+            for head_idx in range(n_heads):
+                grad_es_head = torch.stack(grad_es_lists[head_idx]).to(device).float()
+                output_head = outputs[head_idx]  # shape: [n_pref_update, n_dim]
+                dummy_loss += torch.sum(output_head * grad_es_head.detach())
 
             optimizer.zero_grad()
-            for head_idx in range(n_heads):
-                outputs[head_idx].backward(gradient=grad_es_heads[head_idx], retain_graph=(head_idx != n_heads - 1))
+            dummy_loss.backward()
             optimizer.step()
 
         stop = timeit.default_timer()
+        print("Total time: ", stop - start)
 
         psmodel.eval()
         optimizer.eval()
