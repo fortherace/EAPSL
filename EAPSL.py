@@ -64,8 +64,6 @@ device = 'cpu'
 # -----------------------------------------------------------------------------
 
 
-hv_list = {}
-
 for test_ins in ins_list:
     print(test_ins)
 
@@ -75,12 +73,15 @@ for test_ins in ins_list:
 
     if n_obj == 2:
         n_pref_update = 5
-        nsga_generations = 150     # 50%
-        n_steps = 600
+        nsga_generations = 150
+        if test_ins == 'polygons':
+            n_steps = 150
+        else:
+            n_steps = 67
     else:
         n_pref_update = 8
         nsga_generations = 300     # 50%
-        n_steps = 750
+        n_steps = 187
 
 
     # repeatedly run the algorithm n_run times
@@ -108,7 +109,7 @@ for test_ins in ins_list:
             algorithm,
             termination=get_termination("n_gen", nsga_generations),
             save_history=True,
-            verbose=True
+            verbose=False
         )
         print('number of solutions:', res.F.shape[0])
 
@@ -184,6 +185,7 @@ for test_ins in ins_list:
         pretrain_dataset = PreTrainDataset(all_prefs_tensor, all_X_tensor, all_ps_ids_tensor)
         pretrain_loader = DataLoader(pretrain_dataset, batch_size=128, shuffle=True)
 
+        # optimizer
         optimizer_p = schedulefree.AdamWScheduleFree(psmodel.parameters(), lr=0.0025,
                                                      warmup_steps=10)
 
@@ -206,67 +208,81 @@ for test_ins in ins_list:
         for t_step in range(n_steps):
             psmodel.train()
             optimizer.train()
+            optimizer.zero_grad()
 
             sigma = 0.01
 
-            # sample n_pref_update preferences
             alpha = np.ones(n_obj)
             pref = np.random.dirichlet(alpha, n_pref_update)
-            pref_vec = torch.tensor(pref).to(device).float()
+            pref_vec = torch.tensor(pref, dtype=torch.float32).to(device)
 
-            ids = torch.randint(low=0, high=n_clusters, size=(n_pref_update,), device=device)
-            x = psmodel(pref_vec, ids)
+            n_pref = pref_vec.shape[0]
+            ps_id_all = torch.arange(n_clusters, device=device).repeat(n_pref)
+            pref_vec_repeat = pref_vec.repeat_interleave(n_clusters, dim=0)
 
-            grad_es_list = []
-            for k in range(pref_vec.shape[0]):
-                i_k = ids[k].item()
+            x_all = psmodel(pref_vec_repeat, ps_id_all)
+            n_dim = psmodel.n_dim
+            x_all = x_all.view(n_pref, n_clusters, n_dim)
 
-                if sampling_method == 'Gaussian':
-                    delta = torch.randn(n_sample, n_dim).to(device).double()
+            grad_es_lists = []
 
-                if sampling_method == 'Bernoulli':
-                    delta = (torch.bernoulli(0.5 * torch.ones(n_sample, n_dim)) - 0.5) / 0.5
-                    delta = delta.to(device).double()
+            for i_k in range(n_clusters):
+                x_i = x_all[:, i_k, :].detach().double()
+                grad_es_per_pref = []
 
-                if sampling_method == 'Bernoulli-Shrinkage':
-                    m = np.sqrt((n_sample + n_dim - 1) / (4 * n_sample))
-                    delta = (torch.bernoulli(0.5 * torch.ones(n_sample, n_dim)) - 0.5) / m
-                    delta = delta.to(device).double()
+                for k in range(n_pref):
+                    if sampling_method == 'Gaussian':
+                        delta = torch.randn(n_sample, n_dim).to(device).double()
+                    elif sampling_method == 'Bernoulli':
+                        delta = (torch.bernoulli(0.5 * torch.ones(n_sample, n_dim)) - 0.5) / 0.5
+                        delta = delta.to(device).double()
+                    elif sampling_method == 'Bernoulli-Shrinkage':
+                        m = np.sqrt((n_sample + n_dim - 1) / (4 * n_sample))
+                        delta = (torch.bernoulli(0.5 * torch.ones(n_sample, n_dim)) - 0.5) / m
+                        delta = delta.to(device).double()
+                    else:
+                        raise ValueError("Unsupported sampling method")
 
-                x_plus_delta = x[k] + sigma * delta
-                delta_plus_fixed = delta
-                x_plus_delta[x_plus_delta > 1] = 1
-                x_plus_delta[x_plus_delta < 0] = 0
-                x_plus_delta = x_plus_delta.detach().cpu().numpy() * (max_var[i_k] - min_var[i_k]) + min_var[i_k]
-                value_plus_delta = problem.evaluate(x_plus_delta)
+                    x_plus_delta = x_i[k] + sigma * delta
+                    x_plus_delta = torch.clamp(x_plus_delta, 0.0, 1.0)
+                    x_plus_delta_np = x_plus_delta.cpu().numpy()
+                    x_plus_delta_np = x_plus_delta_np * (max_var[i_k] - min_var[i_k]) + min_var[i_k]
 
-                value_plus_delta = (value_plus_delta - ideal_point) / (
-                            nadir_point - ideal_point)
-                value_plus_delta = torch.from_numpy(value_plus_delta).float().to(device)
+                    value_plus_delta = problem.evaluate(x_plus_delta_np)
+                    value_plus_delta = (value_plus_delta - ideal_point) / (nadir_point - ideal_point)
+                    value_plus_delta = torch.tensor(value_plus_delta, dtype=torch.float32).to(device)
 
-                z = torch.full((n_obj,), -0.1).to(device)
+                    z = torch.full((n_obj,), -0.1).to(device)
+                    u = 0.05
+                    pref_k = pref_vec[k]
+                    tch_value = u * torch.logsumexp((1.0 / pref_k) * torch.abs(value_plus_delta - z) / u, dim=1)
+                    tch_value = tch_value.detach()
 
-                # STCH Scalarization
-                u = 0.05
+                    rank_idx = torch.argsort(tch_value)
+                    tch_value_rank = torch.ones(len(tch_value), device=device)
+                    tch_value_rank[rank_idx] = torch.linspace(-0.5, 0.5, len(tch_value), device=device)
+                    tch_value_rank -= tch_value_rank.mean()
 
-                tch_value = u * torch.logsumexp((1 / pref_vec[k]) * torch.abs(value_plus_delta - z) / u, axis=1)
-                tch_value = tch_value.detach()
+                    grad_es_k = 1.0 / (n_sample * sigma) * torch.sum(
+                        tch_value_rank.view(-1, 1) * delta, dim=0
+                    )
 
-                rank_idx = torch.argsort(tch_value)
-                tch_value_rank = torch.ones(len(tch_value)).to(device)
-                tch_value_rank[rank_idx] = torch.linspace(-0.5, 0.5, len(tch_value)).to(device)
+                    grad_es_per_pref.append(grad_es_k)
 
-                grad_es_k = 1.0 / (n_sample * sigma) * torch.sum(
-                    tch_value_rank.reshape(len(tch_value), 1) * delta_plus_fixed, axis=0)
-                grad_es_list.append(grad_es_k)
+                grad_es_i = torch.stack(grad_es_per_pref)
+                grad_es_lists.append(grad_es_i)
 
-            grad_es = torch.stack(grad_es_list)
+            dummy_loss = 0.0
+            for i_k in range(n_clusters):
+                output_i = x_all[:, i_k, :]
+                grad_es_i = grad_es_lists[i_k].to(device).float().detach()
+                dummy_loss += torch.sum(output_i * grad_es_i)
 
-            # gradient-based pareto set model update
+            dummy_loss /= (n_clusters * n_pref)  
+
             optimizer.zero_grad()
-            psmodel(pref_vec, ids).backward(grad_es)
+            dummy_loss.backward()
             optimizer.step()
-
         #---------------------------------small solution set-------------------------------------
         if n_obj == 2:
             pref = np.stack([np.linspace(0, 1, 100), 1 - np.linspace(0, 1, 100)]).T
